@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Material Optical Properties Explorer</title>
+  <!-- 3rd-party libraries via CDN -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/axios@1/dist/axios.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.30.0/plotly.min.js"></script>
+  <style>
+    /* ===== Base layout ===== */
+    body { margin: 0; font-family: Arial, sans-serif; }
+    .container { padding: 1rem; }
+
+    /* ===== Toolbar / controls ===== */
+    .toolbar {
+      position: sticky; top: 0; z-index: 1000;
+      background: #ffffff; box-shadow: 0 2px 4px rgba(0,0,0,.05);
+      padding: .5rem 1rem; display: flex; flex-direction: column; gap: .5rem;
+    }
+    @media (min-width: 700px) {
+      .toolbar { flex-direction: row; justify-content: space-between; align-items: center; }
+    }
+    .controls { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
+    label { font-weight: 600; }
+    select { margin-left: .3rem; padding: .3rem .6rem; }
+
+    /* ===== Loading spinner (global) ===== */
+    .data-spinner { margin-top: 2rem; font-size: 1.2rem; }
+
+    /* ===== Plot wrapper / spinner overlay ===== */
+    .plot-wrapper { position: relative; width: 100%; height: 80vh; }
+    .plot { width: 100%; height: 100%; }
+    .spinner-overlay {
+      position: absolute; inset: 0; background: rgba(255,255,255,.6); display: flex;
+      align-items: center; justify-content: center; z-index: 999; pointer-events: none;
+    }
+    .spinner {
+      border: 6px solid #f3f3f3; border-top: 6px solid #3498db; border-radius: 50%;
+      width: 40px; height: 40px; animation: spin 1s linear infinite;
+    }
+    @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script>
+  /*****************************************************************************************
+   * Plot3D component – wraps Plotly 3-D scatter plot with a loading overlay                *
+   *****************************************************************************************/
+  const Plot3D = {
+    props: {
+      plotData: { type: Object, required: true },
+      metric:   { type: String, required: true }
+    },
+    setup(props) {
+      const inner = Vue.ref(null);
+      const isRendering = Vue.ref(true);
+      let hasPlotted = false;
+      const MIN_SPINNER_MS = 300;
+      let startTime;
+
+      function draw () {
+        if (!props.plotData || !inner.value) return;
+
+        // Prepare layout dynamically based on props
+        const { traces, categories, ySpacing } = props.plotData;
+        const layout = {
+          title: 'Optical Properties 3D Plot', autosize: true,
+          paper_bgcolor: '#fff', plot_bgcolor: '#fff', margin: { l: 0, r: 0, b: 0, t: 40 },
+          legend: { orientation: 'v', x: 0.02, y: 0.98, xanchor: 'left', bgcolor: 'rgba(255,255,255,0.6)', bordercolor: '#ccc' },
+          scene: {
+            bgcolor: '#f9f9f9', dragmode: 'turntable',
+            camera: { up: { x: 0, y: 1, z: 0 } },
+            xaxis: { title: 'Wavelength (nm)', gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
+            yaxis: { title: 'Material', tickmode: 'array',
+                     tickvals: categories.map((_, i) => i * ySpacing),
+                     ticktext: categories, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
+            zaxis: { title: props.metric, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' }
+          }
+        };
+
+        const config = { responsive: true };
+        isRendering.value = true;
+        startTime = Date.now();
+
+        const promise = hasPlotted
+          ? Plotly.react(inner.value, traces, layout, config)
+          : Plotly.newPlot(inner.value, traces, layout, config);
+
+        promise.finally(() => {
+          hasPlotted = true;
+          // Make sure spinner is visible for a minimal time (to avoid flicker)
+          const elapsed = Date.now() - startTime;
+          const remaining = MIN_SPINNER_MS - elapsed;
+          setTimeout(() => { isRendering.value = false; }, Math.max(0, remaining));
+        });
+      }
+
+      Vue.onMounted(draw);
+      Vue.watch(() => [props.plotData, props.metric], draw);
+
+      return { inner, isRendering };
+    },
+    template: `
+      <div class="plot-wrapper">
+        <div v-if="isRendering" class="spinner-overlay"><div class="spinner"></div></div>
+        <div ref="inner" class="plot"></div>
+      </div>`
+  };
+
+  /*****************************************************************************************
+   * Main application component                                                             *
+   *****************************************************************************************/
+  const App = {
+    components: { Plot3D },
+    setup () {
+      const sheets          = Vue.ref([]);
+      const selectedSheet    = Vue.ref('');
+      const metrics          = ['n','k','Re_e','Im_e','Q','PL','Con','Q_PL','Q_con'];
+      const selectedMetric   = Vue.ref('n');
+      const rawData          = Vue.ref([]);
+      const isDataLoading    = Vue.ref(true);
+      const cache            = Vue.reactive({});
+
+      const palette = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+        '#393b79', '#637939', '#8c6d31', '#843c39', '#7b4173', '#3182bd', '#e6550d', '#31a354', '#756bb1', '#636363'
+      ];
+
+      // Fetch available sheets on mount
+      Vue.onMounted(async () => {
+        try {
+          const { data } = await axios.get('/api/data/sheets');
+          sheets.value = data;
+          selectedSheet.value = data[0] || '';
+        } catch (err) {
+          console.error('Failed to load sheet list', err);
+        }
+      });
+
+      // Whenever selectedSheet changes, load the data for that sheet
+      Vue.watch(selectedSheet, async (newSheet) => {
+        if (!newSheet) return;
+        isDataLoading.value = true;
+        try {
+          const { data } = await axios.get('/api/data', { params: { sheet: newSheet } });
+          rawData.value = data;
+          // Clear metric-specific cache when underlying data changes
+          Object.keys(cache).forEach(key => delete cache[key]);
+        } catch (err) {
+          console.error('Failed to load data', err);
+        }
+        isDataLoading.value = false;
+      }, { immediate: true });
+
+      // ===== Derived/processed data for the Plot3D component =====
+      const plotData = Vue.computed(() => {
+        if (!rawData.value.length) return null;
+        const zMetric = selectedMetric.value;
+        if (cache[zMetric]) return cache[zMetric];
+
+        // Filter rows with valid numeric wavelength and metric values
+        const filtered = rawData.value.filter(r => Number.isFinite(r.wavelength) && Number.isFinite(r[zMetric]));
+        if (!filtered.length) return null;
+
+        // Group by material
+        const grouped = filtered.reduce((acc, row) => {
+          (acc[row.material] = acc[row.material] || []).push(row);
+          return acc;
+        }, {});
+
+        const categories = Object.keys(grouped);
+        const ySpacing = 3;
+        const traces = categories.map((material, idx) => {
+          const rows = grouped[material].slice().sort((a, b) => a.wavelength - b.wavelength);
+          const color = palette[idx % palette.length];
+          const yVal = idx * ySpacing;
+          return {
+            x: rows.map(r => r.wavelength),
+            y: Array(rows.length).fill(yVal),
+            z: rows.map(r => r[zMetric]),
+            mode: 'lines+markers',
+            name: material,
+            type: 'scatter3d',
+            marker: { size: 4, color },
+            line: { color, width: 2 }
+          };
+        });
+
+        cache[zMetric] = { traces, categories, ySpacing };
+        return cache[zMetric];
+      });
+
+      return {
+        sheets,
+        selectedSheet,
+        metrics,
+        selectedMetric,
+        isDataLoading,
+        plotData
+      };
+    },
+    template: `
+      <div class="container">
+        <header class="toolbar">
+          <h1>Material Optical Properties Explorer</h1>
+
+          <div class="controls" v-if="sheets.length">
+            <label for="sheet">Data Range:</label>
+            <select id="sheet" v-model="selectedSheet">
+              <option v-for="s in sheets" :key="s" :value="s">{{ s }}</option>
+            </select>
+
+            <label for="metric">Z-Axis Metric:</label>
+            <select id="metric" v-model="selectedMetric">
+              <option v-for="m in metrics" :key="m" :value="m">{{ m }}</option>
+            </select>
+          </div>
+        </header>
+
+        <div v-if="isDataLoading" class="data-spinner">Loading data…</div>
+        <Plot3D v-else-if="plotData" :plot-data="plotData" :metric="selectedMetric" />
+      </div>`
+  };
+
+  // Bootstrap application
+  Vue.createApp(App).mount('#app');
+  </script>
+</body>
+</html> 
