@@ -6,7 +6,7 @@
   <title>Material Optical Properties Explorer</title>
   <!-- 3rd-party libraries via CDN -->
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/axios@1/dist/axios.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.30.0/plotly.min.js"></script>
   <style>
     /* ===== Base layout ===== */
@@ -118,45 +118,90 @@
     components: { Plot3D },
     setup () {
       const sheets          = Vue.ref([]);
-      const selectedSheet    = Vue.ref('');
-      const metrics          = ['n','k','Re_e','Im_e','Q','PL','Con','Q_PL','Q_con'];
-      const selectedMetric   = Vue.ref('n');
-      const rawData          = Vue.ref([]);
-      const isDataLoading    = Vue.ref(true);
-      const cache            = Vue.reactive({});
+      const selectedSheet   = Vue.ref('');
+      const metrics         = ['n','k','Re_e','Im_e','Q','PL','Con','Q_PL','Q_con'];
+      const selectedMetric  = Vue.ref('n');
+      const isDataLoading   = Vue.ref(true);
+      const cache           = Vue.reactive({});
+      const workbook        = Vue.ref(null);
+      const sheetDataCache  = Vue.reactive({});
 
       const palette = [
         '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
         '#393b79', '#637939', '#8c6d31', '#843c39', '#7b4173', '#3182bd', '#e6550d', '#31a354', '#756bb1', '#636363'
       ];
 
-      // Fetch available sheets on mount
+      function normalizeData(jsonData) {
+        return jsonData.map((row) => {
+          const keys = Object.keys(row);
+
+          const materialKey = keys.find((k) => /material/i.test(k)) || keys.find((k) => /mat/i.test(k));
+          const wavelengthKey = keys.find((k) => /wavelength|lambda|λ/i.test(k));
+
+          const getNumber = (val) => {
+            if (val == null) return null;
+            if (typeof val === 'number') return val;
+            const num = parseFloat(String(val).replace(/[^0-9.+-eE]/g, ''));
+            return isNaN(num) ? null : num;
+          };
+
+          return {
+            material: row['Material'] || row['material'] || row['MAT'] || (materialKey ? row[materialKey] : 'Unknown'),
+            wavelength: getNumber(row['Wavelength'] ?? row['wavelength'] ?? row['λ'] ?? row['lambda'] ?? (wavelengthKey ? row[wavelengthKey] : null)),
+            n: getNumber(row['n']),
+            k: getNumber(row['k']),
+            Re_e: getNumber(row['Re(ε)'] ?? row['Re_e'] ?? row['Re e'] ?? row['Reeps']),
+            Im_e: getNumber(row['Im(ε)'] ?? row['Im_e'] ?? row['Im e'] ?? row['Imeps']),
+            Q: getNumber(row['Q']),
+            PL: getNumber(row['PL']),
+            Con: getNumber(row['Con']),
+            Q_PL: getNumber(row['Q_PL'] ?? row['Q PL'] ?? row['Q-PL']),
+            Q_con: getNumber(row['Q_con'] ?? row['Q Con'] ?? row['Q-con']),
+          };
+        });
+      }
+
+      // Fetch and parse the Excel file on mount
       Vue.onMounted(async () => {
+        isDataLoading.value = true;
         try {
-          const { data } = await axios.get('/api/data/sheets');
-          sheets.value = data;
-          selectedSheet.value = data[0] || '';
+          const response = await fetch('data.xlsx');
+          if (!response.ok) throw new Error(`Failed to fetch data.xlsx: ${response.statusText}`);
+
+          const arrayBuffer = await response.arrayBuffer();
+          const wb = XLSX.read(arrayBuffer, { type: 'buffer' });
+          workbook.value = wb;
+          sheets.value = wb.SheetNames;
+
+          if (wb.SheetNames.length > 0) {
+            selectedSheet.value = wb.SheetNames[0];
+          }
         } catch (err) {
-          console.error('Failed to load sheet list', err);
+          console.error('Failed to load or parse Excel file', err);
+        } finally {
+          isDataLoading.value = false;
         }
       });
 
-      // Whenever selectedSheet changes, load the data for that sheet
-      Vue.watch(selectedSheet, async (newSheet) => {
-        if (!newSheet) return;
-        isDataLoading.value = true;
-        try {
-          const { data } = await axios.get('/api/data', { params: { sheet: newSheet } });
-          rawData.value = data;
-          // Clear metric-specific cache when underlying data changes
-          Object.keys(cache).forEach(key => delete cache[key]);
-        } catch (err) {
-          console.error('Failed to load data', err);
-        }
-        isDataLoading.value = false;
-      }, { immediate: true });
+      // When the selected sheet changes, clear the plot cache
+      Vue.watch(selectedSheet, () => {
+        Object.keys(cache).forEach(key => delete cache[key]);
+      });
 
       // ===== Derived/processed data for the Plot3D component =====
+      const rawData = Vue.computed(() => {
+        if (!workbook.value || !selectedSheet.value) return [];
+        const sheetName = selectedSheet.value;
+
+        if (sheetDataCache[sheetName]) return sheetDataCache[sheetName];
+        
+        const sheet = workbook.value.Sheets[sheetName];
+        const json = XLSX.utils.sheet_to_json(sheet, { defval: null });
+        const normalized = normalizeData(json);
+        sheetDataCache[sheetName] = normalized;
+        return normalized;
+      });
+
       const plotData = Vue.computed(() => {
         if (!rawData.value.length) return null;
         const zMetric = selectedMetric.value;
