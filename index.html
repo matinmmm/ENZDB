@@ -48,9 +48,9 @@
 
   <script>
   /*****************************************************************************************
-   * PlotBar component – wraps Plotly bar plot with a loading overlay                *
+   * Plot3D component – wraps Plotly 3-D bar plot with a loading overlay                *
    *****************************************************************************************/
-  const PlotBar = {
+  const Plot3D = {
     props: {
       plotData: { type: Object, required: true },
       metric:   { type: String, required: true }
@@ -66,14 +66,20 @@
         if (!props.plotData || !inner.value) return;
 
         // Prepare layout dynamically based on props
-        const { traces } = props.plotData;
+        const { traces, categories, ySpacing } = props.plotData;
         const layout = {
-          title: 'Optical Properties Bar Plot', autosize: true,
-          paper_bgcolor: '#fff', plot_bgcolor: '#fff', margin: { l: 50, r: 10, b: 40, t: 40 },
+          title: 'Optical Properties 3D Bar Plot', autosize: true,
+          paper_bgcolor: '#fff', plot_bgcolor: '#fff', margin: { l: 0, r: 0, b: 0, t: 40 },
           legend: { orientation: 'v', x: 0.02, y: 0.98, xanchor: 'left', bgcolor: 'rgba(255,255,255,0.6)', bordercolor: '#ccc' },
-          barmode: 'group',
-          xaxis: { title: 'Wavelength (nm)', gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
-          yaxis: { title: props.metric, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' }
+          scene: {
+            bgcolor: '#f9f9f9', dragmode: 'turntable',
+            camera: { up: { x: 0, y: 1, z: 0 } },
+            xaxis: { title: 'Wavelength (nm)', gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
+            yaxis: { title: 'Material', tickmode: 'array',
+                     tickvals: categories.map((_, i) => i * ySpacing),
+                     ticktext: categories, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
+            zaxis: { title: props.metric, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' }
+          }
         };
 
         const config = { responsive: true };
@@ -109,7 +115,7 @@
    * Main application component                                                             *
    *****************************************************************************************/
   const App = {
-    components: { PlotBar },
+    components: { Plot3D },
     setup () {
       const sheets          = Vue.ref([]);
       const selectedSheet   = Vue.ref('');
@@ -182,7 +188,7 @@
         Object.keys(cache).forEach(key => delete cache[key]);
       });
 
-      // ===== Derived/processed data for the PlotBar component =====
+      // ===== Derived/processed data for the Plot3D component =====
       const rawData = Vue.computed(() => {
         if (!workbook.value || !selectedSheet.value) return [];
         const sheetName = selectedSheet.value;
@@ -212,19 +218,22 @@
         }, {});
 
         const categories = Object.keys(grouped);
+        const ySpacing = 3;
         const traces = categories.map((material, idx) => {
           const rows = grouped[material].slice().sort((a, b) => a.wavelength - b.wavelength);
           const color = palette[idx % palette.length];
+          const yVal = idx * ySpacing;
           return {
             x: rows.map(r => r.wavelength),
-            y: rows.map(r => r[zMetric]),
-            type: 'bar',
+            y: Array(rows.length).fill(yVal),
+            z: rows.map(r => r[zMetric]),
             name: material,
+            type: 'bar3d',
             marker: { color }
           };
         });
 
-        cache[zMetric] = { traces, categories };
+        cache[zMetric] = { traces, categories, ySpacing };
         return cache[zMetric];
       });
 
@@ -256,7 +265,7 @@
         </header>
 
         <div v-if="isDataLoading" class="data-spinner">Loading data…</div>
-        <PlotBar v-else-if="plotData" :plot-data="plotData" :metric="selectedMetric" />
+        <Plot3D v-else-if="plotData" :plot-data="plotData" :metric="selectedMetric" />
       </div>`
   };
 
