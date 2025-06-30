@@ -165,14 +165,15 @@
 
       // State variables for interactivity, defined once in the setup scope
       let hoverTimeoutId = null;
-      let lastHoveredIndex = null;
+      let lastHighlightedMesh = null;
       let isIsolatedByClick = false;
       let isDragging = false;
       let isZooming = false;
       let zoomTimeoutId = null;
       
-      // Track the latest camera settings so we can preserve them in updates
+      // Track the latest camera settings so we can preserve them
       let currentCamera = null;
+      let lastGoodCamera = null; // To prevent flipping the plot upside down
 
       // Define the wheel handler once, so we can add/remove the same reference
       const handleWheel = () => {
@@ -203,7 +204,7 @@
         if (!props.plotData || !inner.value) return;
 
         // Prepare layout dynamically based on props
-        const { traces, categories, ySpacing } = props.plotData;
+        const { traces, categories, ranges } = props.plotData;
         const layout = {
           title: 'Optical Properties 3D Plot', autosize: true,
           paper_bgcolor: '#fff', plot_bgcolor: '#fff', margin: { l: 0, r: 0, b: 0, t: 40 },
@@ -218,12 +219,11 @@
               up: { x: 0, y: 0, z: 1 },
               projection: { type: 'orthographic' }
             },
-            xaxis: { title: 'Wavelength (nm)', gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
-            yaxis: { title: 'Material', tickmode: 'array',
-                     tickvals: categories.map((_, i) => i * ySpacing),
-                     ticktext: categories, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
-            zaxis: { title: props.metric, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
-            lighting: { ambient: 0.8, diffuse: 0.8, specular: 0.2, roughness: 0.5, fresnel: 0.2 }
+            xaxis: { title: 'Wavelength (nm)', gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2', range: ranges.x, showspikes: false },
+            yaxis: { title: 'Im(ε)', gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2', range: ranges.y, showspikes: false },
+            zaxis: { title: props.metric, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2', range: ranges.z, showspikes: false },
+            lighting: { ambient: 0.8, diffuse: 0.8, specular: 0.2, roughness: 0.5, fresnel: 0.2 },
+            aspectmode: 'cube'
           }
         };
 
@@ -242,18 +242,65 @@
           if (!currentCamera) {
             currentCamera = gd._fullLayout.scene.camera;
           }
+          // Initialize the last good camera state when the plot is first drawn or re-drawn
+          if (!lastGoodCamera) {
+            lastGoodCamera = currentCamera;
+          }
+
+          // Remove any existing event listeners to prevent conflicts
+          gd.removeAllListeners('plotly_legendclick');
+          gd.removeAllListeners('plotly_relayouting');
+          gd.removeAllListeners('plotly_relayout');
+
+          // Reset isolation state when data changes
+          isIsolatedByClick = false;
 
           // Always re-bind Plotly events after a draw/react call
           gd.on('plotly_legendclick', d => {
             const clickedIdx = d.curveNumber;
-            const isCurrentlyIsolated = (gd.data[clickedIdx].opacity ?? 1) === 1 && gd.data.some((tr, i) => i !== clickedIdx && (tr.opacity ?? 1) < 1);
+            const clickedTrace = gd.data[clickedIdx];
+            
+            // Only handle clicks on material traces (those with showlegend: true)
+            if (!clickedTrace || clickedTrace.showlegend === false) {
+              return false;
+            }
+            
+            const clickedMaterial = clickedTrace.name;
+            
+            // Only check material traces (those with showlegend: true) for isolation status
+            const isCurrentlyIsolated = (gd.data[clickedIdx].opacity ?? 1) === 1 && 
+              gd.data.some((tr, i) => i !== clickedIdx && (tr.showlegend !== false) && (tr.opacity ?? 1) < 1);
             
             const cam = JSON.parse(JSON.stringify(gd._fullLayout.scene.camera));
             if (isCurrentlyIsolated) {
-              Plotly.update(gd, { opacity: 1 }, { 'scene.camera': cam });
+              // Reset material traces and their edges to full opacity, preserve reference frame
+              const opacities = gd.data.map((tr, i) => {
+                if (tr.showlegend === false) {
+                  // Handle edge traces: match them to their material
+                  if (tr.name && tr.name.startsWith('__edges_')) {
+                    return 1; // Reset edge opacity to full
+                  }
+                  // Preserve original opacity for reference frame and other non-legend traces
+                  return tr.opacity ?? 1;
+                }
+                return 1; // Reset material traces to full opacity
+              });
+              Plotly.update(gd, { opacity: opacities }, { 'scene.camera': cam });
               isIsolatedByClick = false;
             } else {
-              const opacities = gd.data.map((_, i) => i === clickedIdx ? 1 : 0.15);
+              // Apply isolation: clicked material = 1, other materials = 0.05, dim corresponding edges
+              const opacities = gd.data.map((tr, i) => {
+                if (tr.showlegend === false) {
+                  // Handle edge traces: match them to their material
+                  if (tr.name && tr.name.startsWith('__edges_')) {
+                    const edgeMaterial = tr.name.replace('__edges_', '');
+                    return edgeMaterial === clickedMaterial ? 1 : 0.05;
+                  }
+                  // Preserve original opacity for reference frame and other non-legend traces
+                  return tr.opacity ?? 1;
+                }
+                return i === clickedIdx ? 1 : 0.05;
+              });
               Plotly.update(gd, { opacity: opacities }, { 'scene.camera': cam });
               isIsolatedByClick = true;
             }
@@ -261,47 +308,21 @@
           });
 
           gd.on('plotly_relayouting', () => { isDragging = true; });
-          gd.on('plotly_relayout', (ev) => {
+          gd.on('plotly_relayout', () => {
             isDragging = false;
-            // This is the reliable source of truth for the camera state after user interaction
-            if (ev['scene.camera']) {
-              currentCamera = ev['scene.camera'];
+            const newCamera = gd._fullLayout.scene.camera;
+            
+            // This logic prevents the user from tilting the camera too far and flipping the plot
+            if (newCamera.up.z < 0.1) { // 0.1 is a small threshold to prevent near-horizontal views
+              // Snap back to the last known good position
+              Plotly.relayout(gd, { 'scene.camera': lastGoodCamera });
+            } else {
+              // Update both the current camera for redraws and the last good camera for snap-backs
+              currentCamera = newCamera;
+              lastGoodCamera = newCamera;
             }
           });
           
-          gd.on('plotly_hover', ev => {
-            if (isIsolatedByClick || isDragging || isZooming) return;
-            clearTimeout(hoverTimeoutId);
-
-            const point = ev.points[0];
-            const idx = point.curveNumber;
-            hoverInfoText.value = point.data.name;
-
-            if (idx === lastHoveredIndex) return;
-
-            hoverTimeoutId = setTimeout(() => {
-                if (isDragging || isZooming) return;
-                const opacities = gd.data.map((_,i)=> i===idx ? 1 : 0.2);
-                const cam = JSON.parse(JSON.stringify(gd._fullLayout.scene.camera));
-                Plotly.update(gd, { opacity: opacities }, { 'scene.camera': cam });
-                lastHoveredIndex = idx;
-            }, 50);
-          });
-
-          gd.on('plotly_unhover', () => {
-            if (isIsolatedByClick || isDragging || isZooming) return;
-            clearTimeout(hoverTimeoutId);
-            hoverInfoText.value = '';
-
-            if (lastHoveredIndex === null) return;
-
-            hoverTimeoutId = setTimeout(() => {
-                if (isDragging || isZooming) return;
-                Plotly.update(gd, { opacity: 1 }, { 'scene.camera': JSON.parse(JSON.stringify(gd._fullLayout.scene.camera)) });
-                lastHoveredIndex = null;
-            }, 50);
-          });
-
           // Re-bind the native wheel event listener every time.
           // First, remove the old one to prevent duplicates, then add it.
           gd.removeEventListener('wheel', handleWheel);
@@ -322,8 +343,10 @@
         window.removeEventListener('keydown', handleEscape);
       });
       Vue.watch(() => [props.plotData, props.metric], () => {
-        // Reset camera state before redrawing with new data
+        // Reset camera state and isolation state before redrawing with new data
         currentCamera = null;
+        lastGoodCamera = null;
+        isIsolatedByClick = false;
         draw();
       });
 
@@ -401,11 +424,45 @@
       const sheets          = Vue.ref([]);
       const selectedSheet   = Vue.ref('');
       const metrics         = ['n','k','Re_e','Im_e','Q','PL','Con','Q_PL','Q_con'];
-      const selectedMetric  = Vue.ref('n');
+      const selectedMetric  = Vue.ref('Q');
       const currentView     = Vue.ref('3d');
+      const useIQR          = Vue.ref(true);
       const isDataLoading   = Vue.ref(true);
       const workbook        = Vue.ref(null);
       const sheetDataCache  = Vue.reactive({});
+
+      function getPercentile(data, percentile) {
+        const sorted = [...data].sort((a, b) => a - b);
+        const index = (percentile / 100) * (sorted.length - 1);
+        if (Math.floor(index) === index) {
+          return sorted[index];
+        }
+        const i = Math.floor(index);
+        const fraction = index - i;
+        if (i + 1 >= sorted.length) return sorted[i];
+        return sorted[i] + (sorted[i + 1] - sorted[i]) * fraction;
+      }
+      
+      function calculateRobustRange(data) {
+        const numericData = data.filter(Number.isFinite);
+        if (numericData.length < 4) { // Not enough data for quartiles
+          if (numericData.length === 0) return { min: 0, max: 1 };
+          return { min: Math.min(...numericData), max: Math.max(...numericData) };
+        }
+        const q1 = getPercentile(numericData, 25);
+        const q3 = getPercentile(numericData, 75);
+        const iqr = q3 - q1;
+        const lowerFence = q1 - 1.5 * iqr;
+        const upperFence = q3 + 1.5 * iqr;
+        
+        const inliers = numericData.filter(d => d >= lowerFence && d <= upperFence);
+        
+        if (inliers.length === 0) { // Fallback if all data are outliers
+          return { min: Math.min(...numericData), max: Math.max(...numericData) };
+        }
+        
+        return { min: Math.min(...inliers), max: Math.max(...inliers) };
+      }
 
       const palette = [
         '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
@@ -485,7 +542,7 @@
       const commonPlotData = Vue.computed(() => {
         if (!rawData.value.length) return null;
         const zMetric = selectedMetric.value;
-        const filtered = rawData.value.filter(r => Number.isFinite(r.wavelength) && Number.isFinite(r[zMetric]));
+        const filtered = rawData.value.filter(r => Number.isFinite(r.wavelength) && Number.isFinite(r[zMetric]) && Number.isFinite(r.Im_e));
         if (!filtered.length) return null;
 
         const grouped = filtered.reduce((acc, row) => {
@@ -494,40 +551,164 @@
         }, {});
 
         const categories = Object.keys(grouped);
-        return { grouped, categories, zMetric };
+        return { filtered, grouped, categories, zMetric };
       });
 
       const plotData3D = Vue.computed(() => {
         if (!commonPlotData.value) return null;
-        const { grouped, categories, zMetric } = commonPlotData.value;
-        const ySpacing = 3;
-        const traces = categories.map((material, idx) => {
+        const { filtered, grouped, categories, zMetric } = commonPlotData.value;
+
+        let minX, maxX, minY, maxY, minZ, maxZ;
+
+        if (useIQR.value) {
+          // Calculate axis ranges robust to outliers using IQR method
+          const robustX = calculateRobustRange(filtered.map(r => r.wavelength));
+          const robustY = calculateRobustRange(filtered.map(r => r.Im_e));
+          const robustZ = calculateRobustRange(filtered.map(r => r[zMetric]));
+  
+          minX =  robustX.min; maxX = robustX.max;
+          minY =  robustY.min; maxY = robustY.max;
+          minZ =  robustZ.min; maxZ = robustZ.max;
+        } else {
+          // Use simple min/max of all data points
+          minX =  Infinity; maxX = -Infinity;
+          minY =  Infinity; maxY = -Infinity;
+          minZ =  Infinity; maxZ = -Infinity;
+  
+          filtered.forEach(r => {
+            if (r.wavelength < minX) minX = r.wavelength;
+            if (r.wavelength > maxX) maxX = r.wavelength;
+            if (r.Im_e < minY) minY = r.Im_e;
+            if (r.Im_e > maxY) maxY = r.Im_e;
+            if (r[zMetric] < minZ) minZ = r[zMetric];
+            if (r[zMetric] > maxZ) maxZ = r[zMetric];
+          });
+        }
+
+        // Fallback in case data are constant or no data
+        if (!Number.isFinite(minX) || !Number.isFinite(maxX)) {
+          minX = 0; maxX = 1;
+        }
+        if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
+          minY = 0; maxY = 1;
+        }
+        if (minX === maxX) { minX -= 1; maxX += 1; }
+        if (minY === maxY) { minY -= 1; maxY += 1; }
+
+        const FOOTPRINT_FRAC = 0.01; // 1% of span for both axes
+        const dxConst = (maxX - minX) * FOOTPRINT_FRAC;
+        const dyConst = (maxY - minY) * FOOTPRINT_FRAC;
+
+        const barTraces = [];
+        const edgeTraces = [];
+        
+        categories.forEach((material, idx) => {
           const rows = grouped[material].slice().sort((a, b) => a.wavelength - b.wavelength);
           const color = palette[idx % palette.length];
-          const yVal = idx * ySpacing;
-          
-          const x_coords = [], y_coords = [], z_coords = [];
+
+          const vx=[],vy=[],vz=[],I=[],J=[],K=[];
+          const edgeX=[], edgeY=[], edgeZ=[]; // separate edges for this material
           
           rows.forEach(r => {
             const zValue = r[zMetric];
-            if (zValue === null) return;
-            x_coords.push(r.wavelength, r.wavelength, null);
-            y_coords.push(yVal, yVal, null);
-            z_coords.push(0, zValue, null);
+            const yValue = r.Im_e;
+            const xValue = r.wavelength;
+            if (zValue == null || yValue == null || xValue == null) return;
+            const baseIndex = vx.length; // index for this material
+            // 8 vertices of cuboid
+            const verts = [
+              [xValue - dxConst, yValue - dyConst, 0],
+              [xValue + dxConst, yValue - dyConst, 0],
+              [xValue + dxConst, yValue + dyConst, 0],
+              [xValue - dxConst, yValue + dyConst, 0],
+              [xValue - dxConst, yValue - dyConst, zValue],
+              [xValue + dxConst, yValue - dyConst, zValue],
+              [xValue + dxConst, yValue + dyConst, zValue],
+              [xValue - dxConst, yValue + dyConst, zValue]
+            ];
+
+            verts.forEach(v => { vx.push(v[0]); vy.push(v[1]); vz.push(v[2]); });
+
+            const faces = [
+              [0,1,2],[0,2,3],         // bottom
+              [4,5,6],[4,6,7],         // top
+              [0,1,5],[0,5,4],         // sides
+              [1,2,6],[1,6,5],
+              [2,3,7],[2,7,6],
+              [3,0,4],[3,4,7]
+            ];
+
+            faces.forEach(f => { I.push(baseIndex+f[0]); J.push(baseIndex+f[1]); K.push(baseIndex+f[2]); });
+
+            // outline edges (12 lines) for this material
+            const edges=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+            edges.forEach(e=>{
+              edgeX.push(verts[e[0]][0],verts[e[1]][0],null);
+              edgeY.push(verts[e[0]][1],verts[e[1]][1],null);
+              edgeZ.push(verts[e[0]][2],verts[e[1]][2],null);
+            });
           });
           
-          return {
-            x: x_coords,
-            y: y_coords,
-            z: z_coords,
-            mode: 'lines',
-            name: material,
-            type: 'scatter3d',
-            line: { color, width: 5 },
-            hoverinfo: 'name+x+z'
-          };
+          // Add material bar trace
+          barTraces.push({
+            type:'mesh3d',x:vx,y:vy,z:vz,i:I,j:J,k:K,name:material,color,opacity:1,
+            hoverinfo:'text',showlegend:true,flatshading:false
+          });
+          
+          // Add corresponding edge trace for this material
+          edgeTraces.push({
+            type:'scatter3d',mode:'lines',x:edgeX,y:edgeY,z:edgeZ,
+            line:{color:'#000',width:1},hoverinfo:'skip',showlegend:false,
+            name:`__edges_${material}`,opacity:1
+          });
         });
-        return { traces, categories, ySpacing };
+
+        const merged=[...barTraces, ...edgeTraces];
+
+        // Lightweight hover markers at bar centres
+        const hoverXs=[],hoverYs=[],hoverZs=[],hoverTexts=[];
+        categories.forEach((material,idx)=>{
+          grouped[material].forEach(r=>{
+            hoverXs.push(r.wavelength);
+            hoverYs.push(r.Im_e);
+            hoverZs.push(r[zMetric]);
+            hoverTexts.push(`${material}<br>λ: ${r.wavelength} nm<br>Imε: ${r.Im_e}<br>${zMetric}: ${r[zMetric]}`);
+          });
+        });
+        merged.push({type:'scatter3d',mode:'markers',x:hoverXs,y:hoverYs,z:hoverZs,marker:{size:4,color:'rgba(0,0,0,0)'},hovertext:hoverTexts,hoverinfo:'text',showlegend:false});
+
+        // Provide padding etc ...
+        const pad = (min, max) => {
+          if (!Number.isFinite(min) || !Number.isFinite(max)) return [null, null];
+          const span = max - min;
+          if (span === 0) return [min - 1, max + 1];
+          const extra = span * 0.05;
+          return [min - extra, max + extra];
+        };
+
+        const ranges = {
+          x: pad(minX, maxX),
+          y: pad(minY, maxY),
+          z: pad(Math.min(0, minZ), Math.max(0, maxZ))
+        };
+
+        // Add a faint reference plane at z=0 for context
+        if (Number.isFinite(minX) && Number.isFinite(maxX) && Number.isFinite(minY) && Number.isFinite(maxY)) {
+          const planeTrace = {
+            type: 'surface',
+            showscale: false,
+            opacity: 0.5,
+            colorscale: [[0, '#cccccc'], [1, '#cccccc']],
+            hoverinfo: 'skip',
+            x: [[minX, maxX], [minX, maxX]],
+            y: [[minY, minY], [maxY, maxY]],
+            z: [[0, 0], [0, 0]],
+            showlegend: false
+          };
+          merged.unshift(planeTrace);
+        }
+
+        return { traces: merged, categories, ranges };
       });
 
       const plotDataFaceted = Vue.computed(() => {
@@ -579,7 +760,8 @@
             z: z,
             type: 'heatmap',
             colorscale: 'Viridis',
-            showscale: true
+            showscale: true,
+            showlegend: false
         }];
 
         const layout = {
@@ -600,6 +782,7 @@
         metrics,
         selectedMetric,
         currentView,
+        useIQR,
         isDataLoading,
         commonPlotData,
         plotData3D,
@@ -630,6 +813,10 @@
               <button @click="currentView = 'faceted'" :class="{ active: currentView === 'faceted' }" title="View a separate plot for each material. Good for comparing trends.">Faceted</button>
               <button @click="currentView = 'heatmap'" :class="{ active: currentView === 'heatmap' }" title="View all data in a 2D grid. Good for spotting patterns.">Heatmap</button>
             </div>
+            <div style="display: flex; align-items: center; gap: .3rem;">
+              <input type="checkbox" id="iqr-checkbox" v-model="useIQR" title="Use Interquartile Range to filter outliers from axis scaling." style="cursor: pointer;" />
+              <label for="iqr-checkbox" style="font-weight: normal; cursor: pointer;">Use IQR Scale</label>
+            </div>
           </div>
         </header>
 
@@ -648,4 +835,6 @@
   Vue.createApp(App).mount('#app');
   </script>
 </body>
-</html> 
+</html>
+
+</rewritten_file>
