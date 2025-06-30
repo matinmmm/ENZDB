@@ -25,16 +25,33 @@
     .controls { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
     label { font-weight: 600; }
     select { margin-left: .3rem; padding: .3rem .6rem; }
+    .controls button { padding: .3rem .8rem; border: 1px solid #ccc; background: #f0f0f0; cursor: pointer; border-radius: 4px; }
+    .controls button.active { background: #3498db; color: white; border-color: #3498db; }
 
     /* ===== Loading spinner (global) ===== */
     .data-spinner { margin-top: 2rem; font-size: 1.2rem; }
 
     /* ===== Plot wrapper / spinner overlay ===== */
-    .plot-wrapper { position: relative; width: 100%; height: 80vh; }
+    .plot-wrapper { position: relative; width: 100%; height: 90vh; }
+    .plot-wrapper.is-fullscreen {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 2000; background: #fff;
+    }
+    .fullscreen-btn {
+      position: absolute; top: 10px; right: 10px; z-index: 1001;
+      padding: 5px 10px; background: rgba(0,0,0,0.5); color: white;
+      border: none; border-radius: 4px; cursor: pointer;
+    }
+    .fullscreen-btn:hover { background: rgba(0,0,0,0.7); }
     .plot { width: 100%; height: 100%; }
     .spinner-overlay {
       position: absolute; inset: 0; background: rgba(255,255,255,.6); display: flex;
       align-items: center; justify-content: center; z-index: 999; pointer-events: none;
+    }
+    .hover-info {
+      position: absolute; top: 10px; left: 10px; z-index: 1001;
+      background: rgba(0, 0, 0, 0.7); color: white;
+      padding: 5px 10px; border-radius: 5px; font-size: 1rem;
+      pointer-events: none; /* So it doesn't block mouse events to the plot */
     }
     .spinner {
       border: 6px solid #f3f3f3; border-top: 6px solid #3498db; border-radius: 50%;
@@ -47,6 +64,88 @@
   <div id="app"></div>
 
   <script>
+  /*****************************************************************************************
+   * FacetedPlot component – wraps Plotly subplot grid with a loading overlay               *
+   *****************************************************************************************/
+  const FacetedPlot = {
+    props: {
+      plotData: { type: Object, required: true },
+      metric:   { type: String, required: true }
+    },
+    setup(props) {
+      const inner = Vue.ref(null);
+      const isRendering = Vue.ref(true);
+      let hasPlotted = false;
+      const MIN_SPINNER_MS = 300;
+      let startTime;
+      const hoverInfoText = Vue.ref('');
+
+      function draw () {
+        if (!props.plotData || !inner.value) return;
+
+        const { traces, categories } = props.plotData;
+        const numPlots = categories.length;
+        const numCols = Math.min(3, Math.ceil(Math.sqrt(numPlots)));
+        const numRows = Math.ceil(numPlots / numCols);
+
+        const layout = {
+          title: `Optical Properties (${props.metric}) by Material`,
+          autosize: true,
+          height: 300 * numRows, // Adjust height based on number of rows
+          grid: { rows: numRows, columns: numCols, pattern: 'independent' },
+          showlegend: false,
+          paper_bgcolor: '#fff',
+          plot_bgcolor: '#f9f9f9',
+          margin: { l: 50, r: 20, b: 50, t: 60 },
+        };
+
+        // Dynamically add subplot titles using annotations
+        const annotations = [];
+        categories.forEach((name, i) => {
+          const subplotKey = i === 0 ? '' : i + 1;
+          annotations.push({
+            text: `<b>${name}</b>`,
+            font: { size: 14 },
+            showarrow: false,
+            x: 0.5,
+            y: 1.05,
+            xref: `x${subplotKey} domain`,
+            yref: `y${subplotKey} domain`,
+            xanchor: 'center',
+            yanchor: 'bottom',
+          });
+        });
+        layout.annotations = annotations;
+
+        const config = { responsive: true };
+        isRendering.value = true;
+        startTime = Date.now();
+
+        const promise = hasPlotted
+          ? Plotly.react(inner.value, traces, layout, config)
+          : Plotly.newPlot(inner.value, traces, layout, config);
+        
+        promise.finally(() => {
+          hasPlotted = true;
+          const elapsed = Date.now() - startTime;
+          const remaining = MIN_SPINNER_MS - elapsed;
+          setTimeout(() => { isRendering.value = false; }, Math.max(0, remaining));
+        });
+      }
+
+      Vue.onMounted(draw);
+      Vue.watch(() => [props.plotData, props.metric], draw);
+
+      return { inner, isRendering, hoverInfoText };
+    },
+    template: `
+      <div class="plot-wrapper" :style="{ height: 'auto' }">
+        <div class="hover-info" v-if="hoverInfoText">{{ hoverInfoText }}</div>
+        <div v-if="isRendering" class="spinner-overlay"><div class="spinner"></div></div>
+        <div ref="inner" class="plot"></div>
+      </div>`
+  };
+
   /*****************************************************************************************
    * Plot3D component – wraps Plotly 3-D scatter plot with a loading overlay                *
    *****************************************************************************************/
@@ -61,6 +160,44 @@
       let hasPlotted = false;
       const MIN_SPINNER_MS = 300;
       let startTime;
+      const hoverInfoText = Vue.ref('');
+      const isFullScreen = Vue.ref(false);
+
+      // State variables for interactivity, defined once in the setup scope
+      let hoverTimeoutId = null;
+      let lastHoveredIndex = null;
+      let isIsolatedByClick = false;
+      let isDragging = false;
+      let isZooming = false;
+      let zoomTimeoutId = null;
+      
+      // Track the latest camera settings so we can preserve them in updates
+      let currentCamera = null;
+
+      // Define the wheel handler once, so we can add/remove the same reference
+      const handleWheel = () => {
+        isZooming = true;
+        clearTimeout(zoomTimeoutId);
+        zoomTimeoutId = setTimeout(() => { isZooming = false; }, 200);
+      };
+
+      function toggleFullScreen() {
+        isFullScreen.value = !isFullScreen.value;
+      }
+
+      Vue.watch(isFullScreen, () => {
+        Vue.nextTick(() => {
+          if (inner.value) {
+            Plotly.relayout(inner.value, { autosize: true });
+          }
+        });
+      });
+
+      function handleEscape(e) {
+        if (e.key === 'Escape' && isFullScreen.value) {
+            isFullScreen.value = false;
+        }
+      }
 
       function draw () {
         if (!props.plotData || !inner.value) return;
@@ -70,15 +207,23 @@
         const layout = {
           title: 'Optical Properties 3D Plot', autosize: true,
           paper_bgcolor: '#fff', plot_bgcolor: '#fff', margin: { l: 0, r: 0, b: 0, t: 40 },
-          legend: { orientation: 'v', x: 0.02, y: 0.98, xanchor: 'left', bgcolor: 'rgba(255,255,255,0.6)', bordercolor: '#ccc' },
+          legend: {
+            title: { text: 'Materials<br><i>(click to isolate)</i>', font: { size: 12 } },
+            orientation: 'v', x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top',
+            bgcolor: 'rgba(255,255,255,0.6)', bordercolor: '#ccc'
+          },
           scene: {
             bgcolor: '#f9f9f9', dragmode: 'turntable',
-            camera: { up: { x: 0, y: 1, z: 0 } },
+            camera: {
+              up: { x: 0, y: 0, z: 1 },
+              projection: { type: 'orthographic' }
+            },
             xaxis: { title: 'Wavelength (nm)', gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
             yaxis: { title: 'Material', tickmode: 'array',
                      tickvals: categories.map((_, i) => i * ySpacing),
                      ticktext: categories, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
-            zaxis: { title: props.metric, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' }
+            zaxis: { title: props.metric, gridcolor: '#e2e2e2', zerolinecolor: '#e2e2e2' },
+            lighting: { ambient: 0.8, diffuse: 0.8, specular: 0.2, roughness: 0.5, fresnel: 0.2 }
           }
         };
 
@@ -89,10 +234,145 @@
         const promise = hasPlotted
           ? Plotly.react(inner.value, traces, layout, config)
           : Plotly.newPlot(inner.value, traces, layout, config);
+        
+        promise.then(() => {
+          const gd = inner.value;
 
+          // After plot is drawn/updated, set the initial camera if it's not already set
+          if (!currentCamera) {
+            currentCamera = gd._fullLayout.scene.camera;
+          }
+
+          // Always re-bind Plotly events after a draw/react call
+          gd.on('plotly_legendclick', d => {
+            const clickedIdx = d.curveNumber;
+            const isCurrentlyIsolated = (gd.data[clickedIdx].opacity ?? 1) === 1 && gd.data.some((tr, i) => i !== clickedIdx && (tr.opacity ?? 1) < 1);
+            
+            const cam = JSON.parse(JSON.stringify(gd._fullLayout.scene.camera));
+            if (isCurrentlyIsolated) {
+              Plotly.update(gd, { opacity: 1 }, { 'scene.camera': cam });
+              isIsolatedByClick = false;
+            } else {
+              const opacities = gd.data.map((_, i) => i === clickedIdx ? 1 : 0.15);
+              Plotly.update(gd, { opacity: opacities }, { 'scene.camera': cam });
+              isIsolatedByClick = true;
+            }
+            return false;
+          });
+
+          gd.on('plotly_relayouting', () => { isDragging = true; });
+          gd.on('plotly_relayout', (ev) => {
+            isDragging = false;
+            // This is the reliable source of truth for the camera state after user interaction
+            if (ev['scene.camera']) {
+              currentCamera = ev['scene.camera'];
+            }
+          });
+          
+          gd.on('plotly_hover', ev => {
+            if (isIsolatedByClick || isDragging || isZooming) return;
+            clearTimeout(hoverTimeoutId);
+
+            const point = ev.points[0];
+            const idx = point.curveNumber;
+            hoverInfoText.value = point.data.name;
+
+            if (idx === lastHoveredIndex) return;
+
+            hoverTimeoutId = setTimeout(() => {
+                if (isDragging || isZooming) return;
+                const opacities = gd.data.map((_,i)=> i===idx ? 1 : 0.2);
+                const cam = JSON.parse(JSON.stringify(gd._fullLayout.scene.camera));
+                Plotly.update(gd, { opacity: opacities }, { 'scene.camera': cam });
+                lastHoveredIndex = idx;
+            }, 50);
+          });
+
+          gd.on('plotly_unhover', () => {
+            if (isIsolatedByClick || isDragging || isZooming) return;
+            clearTimeout(hoverTimeoutId);
+            hoverInfoText.value = '';
+
+            if (lastHoveredIndex === null) return;
+
+            hoverTimeoutId = setTimeout(() => {
+                if (isDragging || isZooming) return;
+                Plotly.update(gd, { opacity: 1 }, { 'scene.camera': JSON.parse(JSON.stringify(gd._fullLayout.scene.camera)) });
+                lastHoveredIndex = null;
+            }, 50);
+          });
+
+          // Re-bind the native wheel event listener every time.
+          // First, remove the old one to prevent duplicates, then add it.
+          gd.removeEventListener('wheel', handleWheel);
+          gd.addEventListener('wheel', handleWheel);
+        }).finally(() => {
+          hasPlotted = true;
+          const elapsed = Date.now() - startTime;
+          const remaining = MIN_SPINNER_MS - elapsed;
+          setTimeout(() => { isRendering.value = false; }, Math.max(0, remaining));
+        });
+      }
+
+      Vue.onMounted(() => {
+        draw();
+        window.addEventListener('keydown', handleEscape);
+      });
+      Vue.onUnmounted(() => {
+        window.removeEventListener('keydown', handleEscape);
+      });
+      Vue.watch(() => [props.plotData, props.metric], () => {
+        // Reset camera state before redrawing with new data
+        currentCamera = null;
+        draw();
+      });
+
+      return { inner, isRendering, hoverInfoText, isFullScreen, toggleFullScreen };
+    },
+    template: `
+      <div class="plot-wrapper" :class="{ 'is-fullscreen': isFullScreen }">
+        <button class="fullscreen-btn" @click="toggleFullScreen">
+          <span v-if="!isFullScreen">Full Screen</span>
+          <span v-else>Exit Full Screen</span>
+        </button>
+        <div class="hover-info" v-if="hoverInfoText">{{ hoverInfoText }}</div>
+        <div v-if="isRendering" class="spinner-overlay"><div class="spinner"></div></div>
+        <div ref="inner" class="plot"></div>
+      </div>`
+  };
+
+  /*****************************************************************************************
+   * HeatmapPlot component – wraps Plotly heatmap with a loading overlay                   *
+   *****************************************************************************************/
+  const HeatmapPlot = {
+    props: {
+      plotData: { type: Object, required: true },
+      metric:   { type: String, required: true }
+    },
+    setup(props) {
+      const inner = Vue.ref(null);
+      const isRendering = Vue.ref(true);
+      let hasPlotted = false;
+      const MIN_SPINNER_MS = 300;
+      let startTime;
+      const hoverInfoText = Vue.ref('');
+
+      function draw () {
+        if (!props.plotData || !inner.value) return;
+
+        const { traces, layout } = props.plotData;
+        layout.title = `Optical Properties Heatmap (${props.metric})`;
+        const config = { responsive: true };
+        
+        isRendering.value = true;
+        startTime = Date.now();
+
+        const promise = hasPlotted
+          ? Plotly.react(inner.value, traces, layout, config)
+          : Plotly.newPlot(inner.value, traces, layout, config);
+        
         promise.finally(() => {
           hasPlotted = true;
-          // Make sure spinner is visible for a minimal time (to avoid flicker)
           const elapsed = Date.now() - startTime;
           const remaining = MIN_SPINNER_MS - elapsed;
           setTimeout(() => { isRendering.value = false; }, Math.max(0, remaining));
@@ -102,10 +382,11 @@
       Vue.onMounted(draw);
       Vue.watch(() => [props.plotData, props.metric], draw);
 
-      return { inner, isRendering };
+      return { inner, isRendering, hoverInfoText };
     },
     template: `
-      <div class="plot-wrapper">
+      <div class="plot-wrapper" :style="{ height: '80vh' }">
+        <div class="hover-info" v-if="hoverInfoText">{{ hoverInfoText }}</div>
         <div v-if="isRendering" class="spinner-overlay"><div class="spinner"></div></div>
         <div ref="inner" class="plot"></div>
       </div>`
@@ -115,14 +396,14 @@
    * Main application component                                                             *
    *****************************************************************************************/
   const App = {
-    components: { Plot3D },
+    components: { FacetedPlot, Plot3D, HeatmapPlot },
     setup () {
       const sheets          = Vue.ref([]);
       const selectedSheet   = Vue.ref('');
       const metrics         = ['n','k','Re_e','Im_e','Q','PL','Con','Q_PL','Q_con'];
       const selectedMetric  = Vue.ref('n');
+      const currentView     = Vue.ref('3d');
       const isDataLoading   = Vue.ref(true);
-      const cache           = Vue.reactive({});
       const workbook        = Vue.ref(null);
       const sheetDataCache  = Vue.reactive({});
 
@@ -185,10 +466,9 @@
 
       // When the selected sheet changes, clear the plot cache
       Vue.watch(selectedSheet, () => {
-        Object.keys(cache).forEach(key => delete cache[key]);
+        // No longer using a single cache, so this is not needed
       });
 
-      // ===== Derived/processed data for the Plot3D component =====
       const rawData = Vue.computed(() => {
         if (!workbook.value || !selectedSheet.value) return [];
         const sheetName = selectedSheet.value;
@@ -202,41 +482,116 @@
         return normalized;
       });
 
-      const plotData = Vue.computed(() => {
+      const commonPlotData = Vue.computed(() => {
         if (!rawData.value.length) return null;
         const zMetric = selectedMetric.value;
-        if (cache[zMetric]) return cache[zMetric];
-
-        // Filter rows with valid numeric wavelength and metric values
         const filtered = rawData.value.filter(r => Number.isFinite(r.wavelength) && Number.isFinite(r[zMetric]));
         if (!filtered.length) return null;
 
-        // Group by material
         const grouped = filtered.reduce((acc, row) => {
           (acc[row.material] = acc[row.material] || []).push(row);
           return acc;
         }, {});
 
         const categories = Object.keys(grouped);
+        return { grouped, categories, zMetric };
+      });
+
+      const plotData3D = Vue.computed(() => {
+        if (!commonPlotData.value) return null;
+        const { grouped, categories, zMetric } = commonPlotData.value;
         const ySpacing = 3;
         const traces = categories.map((material, idx) => {
           const rows = grouped[material].slice().sort((a, b) => a.wavelength - b.wavelength);
           const color = palette[idx % palette.length];
           const yVal = idx * ySpacing;
+          
+          const x_coords = [], y_coords = [], z_coords = [];
+          
+          rows.forEach(r => {
+            const zValue = r[zMetric];
+            if (zValue === null) return;
+            x_coords.push(r.wavelength, r.wavelength, null);
+            y_coords.push(yVal, yVal, null);
+            z_coords.push(0, zValue, null);
+          });
+          
           return {
-            x: rows.map(r => r.wavelength),
-            y: Array(rows.length).fill(yVal),
-            z: rows.map(r => r[zMetric]),
-            mode: 'lines+markers',
+            x: x_coords,
+            y: y_coords,
+            z: z_coords,
+            mode: 'lines',
             name: material,
             type: 'scatter3d',
-            marker: { size: 4, color },
-            line: { color, width: 2 }
+            line: { color, width: 5 },
+            hoverinfo: 'name+x+z'
           };
         });
+        return { traces, categories, ySpacing };
+      });
 
-        cache[zMetric] = { traces, categories, ySpacing };
-        return cache[zMetric];
+      const plotDataFaceted = Vue.computed(() => {
+        if (!commonPlotData.value) return null;
+        const { grouped, categories, zMetric } = commonPlotData.value;
+        const traces = categories.map((material, idx) => {
+          const rows = grouped[material].slice().sort((a, b) => a.wavelength - b.wavelength);
+          const color = palette[idx % palette.length];
+          const subplotKey = idx === 0 ? '' : idx + 1;
+          return {
+            x: rows.map(r => r.wavelength),
+            y: rows.map(r => r[zMetric]),
+            mode: 'markers',
+            type: 'scatter',
+            name: material,
+            marker: { color, size: 6 },
+            xaxis: `x${subplotKey}`,
+            yaxis: `y${subplotKey}`
+          };
+        });
+        return { traces, categories };
+      });
+
+      const plotDataHeatmap = Vue.computed(() => {
+        if (!commonPlotData.value) return null;
+        const { grouped, categories, zMetric } = commonPlotData.value;
+
+        // Create a sorted, unique list of all wavelengths
+        const allWavelengths = [...new Set(Object.values(grouped).flat().map(r => r.wavelength))].sort((a,b) => a - b);
+        const wavelengthIndexMap = new Map(allWavelengths.map((w, i) => [w, i]));
+
+        // Initialize Z matrix with nulls
+        const z = Array(categories.length).fill(0).map(() => Array(allWavelengths.length).fill(null));
+
+        // Populate the Z matrix
+        categories.forEach((material, matIndex) => {
+          const rows = grouped[material];
+          rows.forEach(row => {
+            const wavIndex = wavelengthIndexMap.get(row.wavelength);
+            if (wavIndex !== undefined) {
+              z[matIndex][wavIndex] = row[zMetric];
+            }
+          });
+        });
+
+        const traces = [{
+            x: allWavelengths,
+            y: categories,
+            z: z,
+            type: 'heatmap',
+            colorscale: 'Viridis',
+            showscale: true
+        }];
+
+        const layout = {
+            autosize: true,
+            xaxis: { title: 'Wavelength (nm)' },
+            yaxis: { title: 'Material', automargin: true },
+            paper_bgcolor: '#fff',
+            plot_bgcolor: '#fff',
+            margin: { t: 60 },
+        };
+
+        return { traces, layout };
       });
 
       return {
@@ -244,31 +599,49 @@
         selectedSheet,
         metrics,
         selectedMetric,
+        currentView,
         isDataLoading,
-        plotData
+        commonPlotData,
+        plotData3D,
+        plotDataFaceted,
+        plotDataHeatmap
       };
     },
     template: `
-      <div class="container">
+      <div class="container" v-cloak>
         <header class="toolbar">
           <h1>Material Optical Properties Explorer</h1>
-
-          <div class="controls" v-if="sheets.length">
-            <label for="sheet">Data Range:</label>
-            <select id="sheet" v-model="selectedSheet">
-              <option v-for="s in sheets" :key="s" :value="s">{{ s }}</option>
-            </select>
-
-            <label for="metric">Z-Axis Metric:</label>
-            <select id="metric" v-model="selectedMetric">
-              <option v-for="m in metrics" :key="m" :value="m">{{ m }}</option>
-            </select>
+          <div class="controls">
+            <div v-if="sheets.length > 1">
+              <label for="sheet-select">Sheet:</label>
+              <select id="sheet-select" v-model="selectedSheet">
+                <option v-for="sheet in sheets" :key="sheet" :value="sheet">{{ sheet }}</option>
+              </select>
+            </div>
+            <div>
+              <label for="metric-select">Metric:</label>
+              <select id="metric-select" v-model="selectedMetric">
+                <option v-for="metric in metrics" :key="metric" :value="metric">{{ metric }}</option>
+              </select>
+            </div>
+            <div>
+              <label>View:</label>
+              <button @click="currentView = '3d'" :class="{ active: currentView === '3d' }" title="View data as 3D bars. Good for seeing overall magnitude.">3D Bars</button>
+              <button @click="currentView = 'faceted'" :class="{ active: currentView === 'faceted' }" title="View a separate plot for each material. Good for comparing trends.">Faceted</button>
+              <button @click="currentView = 'heatmap'" :class="{ active: currentView === 'heatmap' }" title="View all data in a 2D grid. Good for spotting patterns.">Heatmap</button>
+            </div>
           </div>
         </header>
 
-        <div v-if="isDataLoading" class="data-spinner">Loading data…</div>
-        <Plot3D v-else-if="plotData" :plot-data="plotData" :metric="selectedMetric" />
-      </div>`
+        <div v-if="isDataLoading" class="data-spinner">Loading data...</div>
+        <template v-else-if="commonPlotData">
+          <Plot3D v-show="currentView === '3d'" :plot-data="plotData3D" :metric="selectedMetric" />
+          <FacetedPlot v-show="currentView === 'faceted'" :plot-data="plotDataFaceted" :metric="selectedMetric" />
+          <HeatmapPlot v-show="currentView === 'heatmap'" :plot-data="plotDataHeatmap" :metric="selectedMetric" />
+        </template>
+        <div v-else>No valid data to display for the selected metric.</div>
+      </div>
+    `
   };
 
   // Bootstrap application
